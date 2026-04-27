@@ -33,13 +33,13 @@ class ClientVisualizer:
         self._start_time = time.time()
         self._socket = None
 
-    def start(self):
+    async def start(self):
         self.running = True
-        self._socket = asyncio.get_event_loop().run_until_complete(self._setup_udp())
+        self._socket = await self._setup_udp()
         logger.info(f"Client visualizer listening on port {self.listen_port}")
 
     async def _setup_udp(self):
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         class Protocol(asyncio.DatagramProtocol):
             def __init__(inner_self):
@@ -105,7 +105,7 @@ class ClientVisualizer:
         return frame
 
     async def run(self):
-        self.start()
+        await self.start()
         logger.info("Press 'q' to quit")
         try:
             while self.running:
