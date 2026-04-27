@@ -97,7 +97,7 @@ def _create_overlay_window(
     )
 
     ctypes.windll.user32.SetLayeredWindowAttributes(
-        hwnd, ctypes.rgb(*COLOR_KEY), 0, LWA_COLORKEY
+        hwnd, ctypes.windll.user32.RGB(*COLOR_KEY), 0, LWA_COLORKEY
     )
 
     win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
