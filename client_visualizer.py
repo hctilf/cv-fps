@@ -7,8 +7,6 @@ import time
 import ctypes
 from typing import List, Dict
 
-import numpy as np
-
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -19,16 +17,21 @@ WS_EX_TRANSPARENT = 0x00000020
 WS_EX_TOPMOST = 0x00000008
 WS_POPUP = 0x800000
 LWA_COLORKEY = 0x00000001
-LWA_ALPHA = 0x00000002
+AC_SRC_OVER = 0x00
+AC_SRC_ALPHA = 0x01
 
 # Color key: pixels matching this RGB are fully transparent
-COLOR_KEY = (0x80, 0x80, 0x80)  # medium gray
+COLOR_KEY = (0x80, 0x80, 0x80)
 
 
 def _win_rgb(r: int, g: int, b: int) -> int:
     """Windows RGB macro: R | (G << 8) | (B << 16)."""
     return r | (g << 8) | (b << 16)
 
+
+# ---------------------------------------------------------------------------
+# GDI helpers
+# ---------------------------------------------------------------------------
 
 # Register window class once at module load
 _registered_class = False
@@ -51,13 +54,28 @@ def _ensure_window_class():
     _registered_class = True
 
 
-CLASS_COLORS = {
-    "EnemySoldier": (0, 0, 255),
-    "AllySoldier": (0, 255, 0),
-    "Weapon": (255, 255, 0),
-    "Vehicle": (0, 255, 255),
-    "HealthPack": (255, 0, 255),
-}
+class _GdiObject:
+    """RAII wrapper for GDI objects."""
+
+    def __init__(self, create_fn, delete_fn):
+        self._hobj = create_fn()
+        self._delete_fn = delete_fn
+
+    def get(self):
+        return self._hobj
+
+    def delete(self):
+        if self._hobj:
+            self._delete_fn(self._hobj)
+            self._hobj = 0
+
+    def __del__(self):
+        self.delete()
+
+
+# ---------------------------------------------------------------------------
+# Window finding
+# ---------------------------------------------------------------------------
 
 
 def _find_window_by_process(process_name: str):
@@ -88,12 +106,12 @@ def _find_window_by_process(process_name: str):
     return results
 
 
-def _create_overlay_window(
-    left: int,
-    top: int,
-    right: int,
-    bottom: int,
-):
+# ---------------------------------------------------------------------------
+# Window creation
+# ---------------------------------------------------------------------------
+
+
+def _create_overlay_window(left, top, right, bottom):
     """Create a layered popup window positioned over the target."""
     import win32gui
     import win32con
@@ -104,7 +122,7 @@ def _create_overlay_window(
     _ensure_window_class()
 
     hwnd = win32gui.CreateWindowEx(
-        WS_EX_LAYERED | WS_EX_TOPMOST,
+        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST,
         "ESPLayerOverlay",
         "ESP Overlay",
         WS_POPUP,
@@ -127,7 +145,7 @@ def _create_overlay_window(
 
 
 # ---------------------------------------------------------------------------
-# Window procedure for the overlay
+# Window procedure
 # ---------------------------------------------------------------------------
 
 _overlay_state = {
@@ -173,11 +191,24 @@ def _wnd_proc(hwnd, msg, wParam, lParam):
     return win32gui.DefWindowProc(hwnd, msg, wParam, lParam)
 
 
+# ---------------------------------------------------------------------------
+# Render: uses UpdateLayeredWindow (correct API for layered windows)
+# ---------------------------------------------------------------------------
+
+CLASS_COLORS = {
+    "EnemySoldier": (0, 0, 255),
+    "AllySoldier": (0, 255, 0),
+    "Weapon": (255, 255, 0),
+    "Vehicle": (0, 255, 255),
+    "HealthPack": (255, 0, 255),
+}
+
+
 def _render_overlay(hwnd):
-    """Render detections onto the overlay window using GDI."""
+    """Render detections using UpdateLayeredWindow."""
     import win32gui
-    import win32ui
     import win32con
+    import win32ui
 
     state = _overlay_state
     w = state["width"]
@@ -185,16 +216,15 @@ def _render_overlay(hwnd):
     if w <= 0 or h <= 0:
         return
 
-    hdc = win32gui.GetDC(hwnd)
-    if not hdc:
-        return
-
     try:
-        mem_dc = win32ui.CreateCompatibleDC(hdc)
-        bitmap = win32ui.CreateCompatibleBitmap(hdc, w, h)
-        mem_dc.SelectObject(bitmap)
+        # Create memory DC and bitmap
+        hdc_screen = win32gui.GetDC(0)  # desktop DC
+        hdc_mem = win32ui.CreateCompatibleDC(hdc_screen)
+        hbmp = win32ui.CreateCompatibleBitmap(hdc_screen, w, h)
+        hdc_mem.SelectObject(hbmp)
 
-        mem_dc.FillSolidRect(0, 0, w, h, _win_rgb(*COLOR_KEY))
+        # Fill with color key (transparent)
+        hdc_mem.FillSolidRect(0, 0, w, h, _win_rgb(*COLOR_KEY))
 
         detections = state.get("detections", [])
         for det in detections:
@@ -207,23 +237,23 @@ def _render_overlay(hwnd):
             x1, y1 = max(0, x1), max(0, y1)
             x2, y2 = min(w, x2), min(h, y2)
 
-            pen = win32ui.CreatePen(win32con.PS_SOLID, 2, color)
-            old_pen = mem_dc.SelectObject(pen)
-            mem_dc.Rectangle([x1, y1, x2, y2])
-            mem_dc.SelectObject(old_pen)
-            mem_dc.DeleteObject(pen)
+            # Draw rectangle
+            hpen = win32gui.CreatePen(win32con.PS_SOLID, 2, _win_rgb(*color))
+            old_pen = hdc_mem.SelectObject(hpen)
+            hdc_mem.Rectangle([x1, y1, x2, y2])
+            hdc_mem.SelectObject(old_pen)
+            win32gui.DeleteObject(hpen)
 
+            # Label
             label = f"{cls_name} {conf:.2f}"
-            text_w, text_h = mem_dc.GetTextExtent(label)
-            label_x, label_y = x1, y1 - text_h - 6
-            if label_y < 0:
-                label_y = y1 + 4
-            mem_dc.FillSolidRect(
-                label_x, label_y, text_w + 6, text_h + 4, _win_rgb(*color)
-            )
-            mem_dc.SetTextColor((0, 0, 0))
-            mem_dc.SetBkMode(win32con.TRANSPARENT)
-            mem_dc.TextOut(label_x + 3, label_y + 2, label)
+            text_w, text_h = hdc_mem.GetTextExtent(label)
+            lx, ly = x1, y1 - text_h - 6
+            if ly < 0:
+                ly = y1 + 4
+            hdc_mem.FillSolidRect(lx, ly, text_w + 6, text_h + 4, _win_rgb(*color))
+            hdc_mem.SetTextColor((0, 0, 0))
+            hdc_mem.SetBkMode(win32con.TRANSPARENT)
+            hdc_mem.TextOut(lx + 3, ly + 2, label)
 
         # HUD
         state["frame_count"] += 1
@@ -236,36 +266,45 @@ def _render_overlay(hwnd):
             f"Infer: {state['last_infer_ms']:.1f}ms",
             f"Detections: {len(detections)}",
         ]
-        y_offset = 20
+        y_off = 20
         for line in hud_lines:
-            text_w, _ = mem_dc.GetTextExtent(line)
-            mem_dc.FillSolidRect(6, y_offset - 16, text_w + 10, 20, _win_rgb(0, 0, 0))
-            mem_dc.SetTextColor((255, 255, 255))
-            mem_dc.SetBkMode(win32con.TRANSPARENT)
-            mem_dc.TextOut(10, y_offset, line)
-            y_offset += 22
+            tw, _ = hdc_mem.GetTextExtent(line)
+            hdc_mem.FillSolidRect(6, y_off - 16, tw + 10, 20, _win_rgb(0, 0, 0))
+            hdc_mem.SetTextColor((255, 255, 255))
+            hdc_mem.SetBkMode(win32con.TRANSPARENT)
+            hdc_mem.TextOut(10, y_off, line)
+            y_off += 22
 
-        win32gui.BitBlt(
-            hdc,
-            0,
-            0,
-            w,
-            h,
-            mem_dc.GetSafeHdc(),
-            0,
-            0,
-            win32con.SRCCOPY,
+        # Get window position for UpdateLayeredWindow
+        rect = win32gui.GetWindowRect(hwnd)
+        pt = ctypes.wintypes.POINT(rect[0], rect[1])
+        size = ctypes.wintypes.SIZE(w, h)
+
+        # BLENDFUNCTION for color-key transparency
+        blend = ctypes.wintypes.BLENDFUNCTION()
+        blend.BlendOp = AC_SRC_OVER
+        blend.BlendFlags = 0
+        blend.SourceConstantAlpha = 255
+        blend.AlphaFormat = AC_SRC_ALPHA
+
+        # UpdateLayeredWindow replaces BitBlt for layered windows
+        ctypes.windll.user32.UpdateLayeredWindow(
+            hwnd,
+            hdc_screen,
+            ctypes.byref(pt),
+            ctypes.byref(size),
+            hdc_mem.GetSafeHdc(),
+            ctypes.wintypes.POINT(0, 0),
+            _win_rgb(*COLOR_KEY),
+            ctypes.byref(blend),
+            win32con.ULW_COLORKEY,
         )
 
-        mem_dc.DeleteDC()
-        bitmap.DeleteObject()
-        win32gui.ReleaseDC(hwnd, hdc)
+        hdc_mem.DeleteDC()
+        hbmp.DeleteObject()
+        win32gui.ReleaseDC(0, hdc_screen)
     except Exception as e:
         logger.debug(f"Render error: {e}")
-        try:
-            win32gui.ReleaseDC(hwnd, hdc)
-        except Exception:
-            pass
 
 
 # ---------------------------------------------------------------------------
@@ -274,11 +313,7 @@ def _render_overlay(hwnd):
 
 
 class ClientVisualizer:
-    def __init__(
-        self,
-        listen_port: int = 8888,
-        process_name: str = "",
-    ):
+    def __init__(self, listen_port: int = 8888, process_name: str = ""):
         self.listen_port = listen_port
         self.process_name = process_name
         self.running = False
