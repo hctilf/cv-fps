@@ -243,7 +243,8 @@ def _init_overlay_window(width: int, height: int):
         glfw.terminate()
         raise Exception("Could not create overlay window")
 
-    glfw.set_window_pos(_overlay_window, 0, 0, width, height)
+    glfw.set_window_pos(_overlay_window, 0, 0)
+    glfw.set_window_size(_overlay_window, width, height)
     glfw.make_context_current(_overlay_window)
     imgui.create_context()
     impl = GlfwRenderer(_overlay_window)
