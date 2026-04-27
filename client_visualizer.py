@@ -30,6 +30,27 @@ def _win_rgb(r: int, g: int, b: int) -> int:
     return r | (g << 8) | (b << 16)
 
 
+# Register window class once at module load
+_registered_class = False
+
+
+def _ensure_window_class():
+    """Register the overlay window class exactly once."""
+    global _registered_class
+    if _registered_class:
+        return
+    import win32gui
+    import win32con
+
+    wclass = win32gui.WNDCLASS()
+    wclass.lpfnWndProc = _wnd_proc
+    wclass.lpszClassName = "ESPLayerOverlay"
+    wclass.style = win32con.CS_HREDRAW | win32con.CS_VREDRAW
+    wclass.hInstance = win32gui.GetModuleHandle(None)
+    win32gui.RegisterClass(wclass)
+    _registered_class = True
+
+
 CLASS_COLORS = {
     "EnemySoldier": (0, 0, 255),
     "AllySoldier": (0, 255, 0),
@@ -80,15 +101,10 @@ def _create_overlay_window(
     width = right - left
     height = bottom - top
 
-    wclass = win32gui.WNDCLASS()
-    wclass.lpfnWndProc = _wnd_proc
-    wclass.lpszClassName = "ESPLayerOverlay"
-    wclass.style = win32con.CS_HREDRAW | win32con.CS_VREDRAW
-    wclass.hInstance = win32gui.GetModuleHandle(None)
-    class_atom = win32gui.RegisterClass(wclass)
+    _ensure_window_class()
 
     hwnd = win32gui.CreateWindowEx(
-        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST,
+        WS_EX_LAYERED | WS_EX_TOPMOST,
         "ESPLayerOverlay",
         "ESP Overlay",
         WS_POPUP,
@@ -178,7 +194,7 @@ def _render_overlay(hwnd):
         bitmap = win32ui.CreateCompatibleBitmap(hdc, w, h)
         mem_dc.SelectObject(bitmap)
 
-        mem_dc.FillSolidRect(0, 0, w, h, *COLOR_KEY)
+        mem_dc.FillSolidRect(0, 0, w, h, _win_rgb(*COLOR_KEY))
 
         detections = state.get("detections", [])
         for det in detections:
@@ -202,7 +218,9 @@ def _render_overlay(hwnd):
             label_x, label_y = x1, y1 - text_h - 6
             if label_y < 0:
                 label_y = y1 + 4
-            mem_dc.FillSolidRect(label_x, label_y, text_w + 6, text_h + 4, *color)
+            mem_dc.FillSolidRect(
+                label_x, label_y, text_w + 6, text_h + 4, _win_rgb(*color)
+            )
             mem_dc.SetTextColor((0, 0, 0))
             mem_dc.SetBkMode(win32con.TRANSPARENT)
             mem_dc.TextOut(label_x + 3, label_y + 2, label)
@@ -221,7 +239,7 @@ def _render_overlay(hwnd):
         y_offset = 20
         for line in hud_lines:
             text_w, _ = mem_dc.GetTextExtent(line)
-            mem_dc.FillSolidRect(6, y_offset - 16, text_w + 10, 20, (0, 0, 0))
+            mem_dc.FillSolidRect(6, y_offset - 16, text_w + 10, 20, _win_rgb(0, 0, 0))
             mem_dc.SetTextColor((255, 255, 255))
             mem_dc.SetBkMode(win32con.TRANSPARENT)
             mem_dc.TextOut(10, y_offset, line)
