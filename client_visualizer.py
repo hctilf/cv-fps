@@ -24,6 +24,12 @@ LWA_ALPHA = 0x00000002
 # Color key: pixels matching this RGB are fully transparent
 COLOR_KEY = (0x80, 0x80, 0x80)  # medium gray
 
+
+def _win_rgb(r: int, g: int, b: int) -> int:
+    """Windows RGB macro: R | (G << 8) | (B << 16)."""
+    return r | (g << 8) | (b << 16)
+
+
 CLASS_COLORS = {
     "EnemySoldier": (0, 0, 255),
     "AllySoldier": (0, 255, 0),
@@ -97,7 +103,7 @@ def _create_overlay_window(
     )
 
     ctypes.windll.user32.SetLayeredWindowAttributes(
-        hwnd, ctypes.windll.user32.RGB(*COLOR_KEY), 0, LWA_COLORKEY
+        hwnd, _win_rgb(*COLOR_KEY), 0, LWA_COLORKEY
     )
 
     win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
