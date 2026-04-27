@@ -58,9 +58,9 @@ class InferenceWorker:
         logger.info(f"Loading model {self.model_path} on {self.device}")
         self._model = YOLO(self.model_path, task="detect")
         self._model.to(self.device)
+        self._model.fuse()
         if self.half:
             self._model.half()
-        self._model.fuse()
         logger.info(f"Model loaded on {self.device}")
 
     def start(self, zmq_ctx: Optional[zmq.Context] = None):
