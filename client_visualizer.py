@@ -1,381 +1,247 @@
-"""Client visualizer: receives bbox JSON from server, draws overlay on a target window."""
+"""Client visualizer: receives bbox JSON from server, draws overlay on a target window (Linux)."""
 
 import asyncio
 import json
 import logging
+import math
 import time
-import ctypes
 from typing import List, Dict
+
+import cv2
+import glfw
+import imgui
+import mss
+import numpy as np
+from imgui.integrations.glfw import GlfwRenderer
+from OpenGL import GL as gl
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Windows constants
-# ---------------------------------------------------------------------------
-WS_EX_LAYERED = 0x00080000
-WS_EX_TRANSPARENT = 0x00000020
-WS_EX_TOPMOST = 0x00000008
-WS_POPUP = 0x800000
-LWA_COLORKEY = 0x00000001
-AC_SRC_OVER = 0x00
-AC_SRC_ALPHA = 0x01
 
-# Color key: pixels matching this RGB are fully transparent
-COLOR_KEY = (0x80, 0x80, 0x80)
-
-
-def _win_rgb(r: int, g: int, b: int) -> int:
-    """Windows RGB macro: R | (G << 8) | (B << 16)."""
-    return r | (g << 8) | (b << 16)
-
-
-# ---------------------------------------------------------------------------
-# GDI helpers
-# ---------------------------------------------------------------------------
-
-# Register window class once at module load
-_registered_class = False
-
-
-def _ensure_window_class():
-    """Register the overlay window class exactly once."""
-    global _registered_class
-    if _registered_class:
-        return
-    import win32gui
-    import win32con
-
-    wclass = win32gui.WNDCLASS()
-    wclass.lpfnWndProc = _wnd_proc
-    wclass.lpszClassName = "ESPLayerOverlay"
-    wclass.style = win32con.CS_HREDRAW | win32con.CS_VREDRAW
-    wclass.hInstance = win32gui.GetModuleHandle(None)
-    win32gui.RegisterClass(wclass)
-    _registered_class = True
-
-
-class _GdiObject:
-    """RAII wrapper for GDI objects."""
-
-    def __init__(self, create_fn, delete_fn):
-        self._hobj = create_fn()
-        self._delete_fn = delete_fn
-
-    def get(self):
-        return self._hobj
-
-    def delete(self):
-        if self._hobj:
-            self._delete_fn(self._hobj)
-            self._hobj = 0
-
-    def __del__(self):
-        self.delete()
-
-
-# ---------------------------------------------------------------------------
-# Window finding
-# ---------------------------------------------------------------------------
-
-
-def _find_window_by_process(process_name: str):
-    """Find the first top-level window whose process name matches."""
-    import win32gui
-    import win32process
-
-    results = []
-
-    def enum_cb(hwnd, acc):
-        try:
-            _, pid = win32process.GetWindowThreadProcessId(hwnd)
-            handle = ctypes.windll.kernel32.OpenProcess(0x0410, False, pid)
-            if handle:
-                try:
-                    buf = ctypes.create_unicode_buffer(260)
-                    ctypes.windll.psapi.GetProcessImageFileNameW(handle, buf, 260)
-                    ctypes.windll.kernel32.CloseHandle(handle)
-                    if process_name.lower() in buf.value.lower():
-                        acc.append((hwnd, win32gui.GetWindowRect(hwnd)))
-                except Exception:
-                    ctypes.windll.kernel32.CloseHandle(handle)
-        except Exception:
-            pass
-        return True
-
-    win32gui.EnumWindows(enum_cb, results)
-    return results
-
-
-# ---------------------------------------------------------------------------
-# Window creation
-# ---------------------------------------------------------------------------
-
-
-def _create_overlay_window(left, top, right, bottom):
-    """Create a layered popup window positioned over the target."""
-    import win32gui
-    import win32con
-
-    width = right - left
-    height = bottom - top
-
-    _ensure_window_class()
-
-    hwnd = win32gui.CreateWindowEx(
-        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST,
-        "ESPLayerOverlay",
-        "ESP Overlay",
-        WS_POPUP,
-        left,
-        top,
-        width,
-        height,
-        None,
-        None,
-        None,
-        None,
-    )
-
-    ctypes.windll.user32.SetLayeredWindowAttributes(
-        hwnd, _win_rgb(*COLOR_KEY), 0, LWA_COLORKEY
-    )
-
-    win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
-    return hwnd
-
-
-# ---------------------------------------------------------------------------
-# Window procedure
-# ---------------------------------------------------------------------------
-
-_overlay_state = {
-    "hwnd": None,
-    "width": 0,
-    "height": 0,
-    "detections": [],
-    "last_infer_ms": 0.0,
-    "fps": 0.0,
-    "frame_count": 0,
-    "_start_time": None,
-}
-
-
-def _wnd_proc(hwnd, msg, wParam, lParam):
-    import win32gui
-    import win32con
-    import win32api
-
-    WM_PAINT = 0x000F
-    WM_DESTROY = 0x0002
-    WM_ERASEBKGND = 0x0014
-    WM_SIZE = 0x0005
-
-    if msg == WM_PAINT:
-        _render_overlay(hwnd)
-        return 0
-
-    if msg == WM_SIZE:
-        w = win32api.LOWORD(lParam)
-        h = win32api.HIWORD(lParam)
-        if w > 0 and h > 0:
-            _overlay_state["width"] = w
-            _overlay_state["height"] = h
-        return 0
-
-    if msg == WM_DESTROY:
-        return 0
-
-    if msg == WM_ERASEBKGND:
-        return 1
-
-    return win32gui.DefWindowProc(hwnd, msg, wParam, lParam)
-
-
-# ---------------------------------------------------------------------------
-# Render: uses UpdateLayeredWindow (correct API for layered windows)
-# ---------------------------------------------------------------------------
-
-CLASS_COLORS = {
-    "EnemySoldier": (0, 0, 255),
-    "AllySoldier": (0, 255, 0),
-    "Weapon": (255, 255, 0),
-    "Vehicle": (0, 255, 255),
-    "HealthPack": (255, 0, 255),
-}
-
-
-def _render_overlay(hwnd):
-    """Render detections using UpdateLayeredWindow."""
-    import win32gui
-    import win32con
-    import win32ui
-
-    state = _overlay_state
-    w = state["width"]
-    h = state["height"]
-    if w <= 0 or h <= 0:
-        return
-
+def capture_window_linux(window_title: str):
+    """Linux implementation using ewmh and Xlib."""
     try:
-        # Create memory DC and bitmap
-        hdc_screen = win32gui.GetDC(0)  # desktop DC
-        hdc_mem = win32ui.CreateCompatibleDC(hdc_screen)
-        hbmp = win32ui.CreateCompatibleBitmap(hdc_screen, w, h)
-        hdc_mem.SelectObject(hbmp)
+        from ewmh import EWMH
+        from Xlib.display import Display
 
-        # Fill with color key (transparent)
-        hdc_mem.FillSolidRect(0, 0, w, h, _win_rgb(*COLOR_KEY))
+        ewmh = EWMH()
+        display = Display()
 
-        detections = state.get("detections", [])
-        for det in detections:
-            cls_name = det.get("class", "unknown")
-            bbox = det.get("bbox", [0, 0, 0, 0])
-            conf = det.get("conf", 0.0)
-            color = CLASS_COLORS.get(cls_name, (200, 200, 200))
+        windows = [win for win in ewmh.getClientList()
+                   if window_title in (ewmh.getWmName(win) or b'').decode('utf-8', errors='ignore')]
 
-            x1, y1, x2, y2 = [int(v) for v in bbox]
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(w, x2), min(h, y2)
+        if not windows:
+            logger.debug(f"Window '{window_title}' not found")
+            return None, None
 
-            # Draw rectangle
-            hpen = win32gui.CreatePen(win32con.PS_SOLID, 2, _win_rgb(*color))
-            old_pen = hdc_mem.SelectObject(hpen)
-            hdc_mem.Rectangle([x1, y1, x2, y2])
-            hdc_mem.SelectObject(old_pen)
-            win32gui.DeleteObject(hpen)
+        window = windows[0]
+        geom = window.get_geometry()
+        attrs = window.get_attributes()
 
-            # Label
-            label = f"{cls_name} {conf:.2f}"
-            text_w, text_h = hdc_mem.GetTextExtent(label)
-            lx, ly = x1, y1 - text_h - 6
-            if ly < 0:
-                ly = y1 + 4
-            hdc_mem.FillSolidRect(lx, ly, text_w + 6, text_h + 4, _win_rgb(*color))
-            hdc_mem.SetTextColor((0, 0, 0))
-            hdc_mem.SetBkMode(win32con.TRANSPARENT)
-            hdc_mem.TextOut(lx + 3, ly + 2, label)
+        if attrs.map_state != 2:
+            logger.debug(f"Window '{window_title}' is not visible")
+            return None, None
 
-        # HUD
-        state["frame_count"] += 1
-        elapsed = time.time() - (state["_start_time"] or time.time())
-        if elapsed > 0:
-            state["fps"] = state["frame_count"] / elapsed
+        win_x, win_y = geom.x, geom.y
+        win_width, win_height = geom.width, geom.height
 
-        hud_lines = [
-            f"FPS: {state['fps']:.1f}",
-            f"Infer: {state['last_infer_ms']:.1f}ms",
-            f"Detections: {len(detections)}",
-        ]
-        y_off = 20
-        for line in hud_lines:
-            tw, _ = hdc_mem.GetTextExtent(line)
-            hdc_mem.FillSolidRect(6, y_off - 16, tw + 10, 20, _win_rgb(0, 0, 0))
-            hdc_mem.SetTextColor((255, 255, 255))
-            hdc_mem.SetBkMode(win32con.TRANSPARENT)
-            hdc_mem.TextOut(10, y_off, line)
-            y_off += 22
+        try:
+            frame_extents = ewmh.getFrameExtents(window)
+            left = win_x - frame_extents['left']
+            top = win_y - frame_extents['top']
+            width = win_width + frame_extents['left'] + frame_extents['right']
+            height = win_height + frame_extents['top'] + frame_extents['bottom']
+        except Exception:
+            left, top = win_x, win_y
+            width, height = win_width, win_height
 
-        # Get window position for UpdateLayeredWindow
-        rect = win32gui.GetWindowRect(hwnd)
-        pt = ctypes.wintypes.POINT(rect[0], rect[1])
-        size = ctypes.wintypes.SIZE(w, h)
+        monitor = {
+            "top": top,
+            "left": left,
+            "width": width,
+            "height": height,
+        }
 
-        # BLENDFUNCTION for color-key transparency
-        blend = ctypes.wintypes.BLENDFUNCTION()
-        blend.BlendOp = AC_SRC_OVER
-        blend.BlendFlags = 0
-        blend.SourceConstantAlpha = 255
-        blend.AlphaFormat = AC_SRC_ALPHA
-
-        # UpdateLayeredWindow replaces BitBlt for layered windows
-        ctypes.windll.user32.UpdateLayeredWindow(
-            hwnd,
-            hdc_screen,
-            ctypes.byref(pt),
-            ctypes.byref(size),
-            hdc_mem.GetSafeHdc(),
-            ctypes.wintypes.POINT(0, 0),
-            _win_rgb(*COLOR_KEY),
-            ctypes.byref(blend),
-            win32con.ULW_COLORKEY,
-        )
-
-        hdc_mem.DeleteDC()
-        hbmp.DeleteObject()
-        win32gui.ReleaseDC(0, hdc_screen)
+        with mss.mss() as sct:
+            screenshot = sct.grab(monitor)
+            img = np.array(screenshot)
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+            return img, monitor
     except Exception as e:
-        logger.debug(f"Render error: {e}")
+        logger.debug(f"Capture error: {e}")
+        return None, None
 
 
-# ---------------------------------------------------------------------------
-# Main visualizer
-# ---------------------------------------------------------------------------
+# --- OVERLAY DRAWING LOGIC ---
 
+detections: List[Dict] = []
+_overlay_window = None
+_model = None
+
+
+def _esp(draw_list):
+    """Draw ESP-style bounding boxes on overlay."""
+    for det in detections:
+        cls_name = det.get("class", "unknown")
+        bbox = det.get("bbox", [0, 0, 0, 0])
+        conf = det.get("conf", 0.0)
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        label = f"{cls_name} {conf:.2f}"
+
+        color = _get_class_color(cls_name)
+        r, g, b = color
+        draw_list.add_rect(x1, y1, x2, y2,
+                           imgui.get_color_u32_rgba(r / 255.0, g / 255.0, b / 255.0, 1.0),
+                           thickness=2)
+        draw_list.add_text(x1, y1 - 15,
+                           imgui.get_color_u32_rgba(1, 1, 1, 1), label)
+
+
+def _get_class_color(cls_name: str):
+    """Return (R, G, B) color for a class name."""
+    colors = {
+        "EnemySoldier": (0, 0, 255),
+        "AllySoldier": (0, 255, 0),
+        "Weapon": (255, 255, 0),
+        "Vehicle": (0, 255, 255),
+        "HealthPack": (255, 0, 255),
+        "person": (0, 255, 0),
+    }
+    return colors.get(cls_name, (200, 200, 200))
+
+
+# --- GLFW / IMGUI INITIALIZATION ---
+
+def _init_overlay_window(width: int, height: int):
+    global _overlay_window
+    if not glfw.init():
+        raise Exception("Failed to initialize GLFW")
+
+    glfw.window_hint(glfw.TRANSPARENT_FRAMEBUFFER, glfw.TRUE)
+    glfw.window_hint(glfw.DECORATED, glfw.FALSE)
+    glfw.window_hint(glfw.FLOATING, glfw.TRUE)
+    glfw.window_hint(glfw.FOCUS_ON_SHOW, glfw.FALSE)
+    glfw.window_hint(glfw.VISIBLE, glfw.TRUE)
+
+    _overlay_window = glfw.create_window(width, height, "ESP Overlay", None, None)
+    if not _overlay_window:
+        glfw.terminate()
+        raise Exception("Could not create overlay window")
+
+    glfw.set_window_pos(_overlay_window, 0, 0, width, height)
+    glfw.make_context_current(_overlay_window)
+    imgui.create_context()
+    impl = GlfwRenderer(_overlay_window)
+    glfw.set_input_mode(_overlay_window, glfw.CURSOR, glfw.CURSOR_HIDDEN)
+
+    return impl
+
+
+# --- MAIN LOOP ---
+
+def _run_detection_loop(window_title: str):
+    """Generator that captures, runs inference, yields detections."""
+    global _model
+    if _model is None:
+        from ultralytics import YOLO
+        _model = YOLO("yolo11n.pt").to("cpu")
+
+    class_names = ["person", "bicycle", "car", "motorbike", "aeroplane", "bus", "train", "truck", "boat",
+                   "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat",
+                   "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella",
+                   "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball", "kite", "baseball bat",
+                   "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup",
+                   "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange", "broccoli",
+                   "carrot", "hot dog", "pizza", "donut", "cake", "chair", "sofa", "pottedplant", "bed",
+                   "diningtable", "toilet", "tvmonitor", "laptop", "mouse", "remote", "keyboard", "cell phone",
+                   "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors",
+                   "teddy bear", "hair drier", "toothbrush"]
+
+    while True:
+        global detections
+        detections.clear()
+
+        img, monitor_info = capture_window_linux(window_title)
+        if img is None or monitor_info is None:
+            time.sleep(0.1)
+            yield
+            continue
+
+        left, top = monitor_info['left'], monitor_info['top']
+        width, height = monitor_info['width'], monitor_info['height']
+
+        glfw.set_window_pos(_overlay_window, left, top)
+
+        results = _model(img, stream=True)
+
+        for r in results:
+            boxes = r.boxes
+            for box in boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                conf = math.ceil((box.conf[0] * 100)) / 100
+                cls = int(box.cls[0])
+                class_name = class_names[cls]
+                detections.append({
+                    "class": class_name,
+                    "bbox": [x1, y1, x2, y2],
+                    "conf": conf,
+                })
+
+        yield
+
+
+# --- MAIN VISUALIZER ---
 
 class ClientVisualizer:
-    def __init__(self, listen_port: int = 8888, process_name: str = ""):
+    def __init__(self, listen_port: int = 8888, window_title: str = "", standalone: bool = True):
         self.listen_port = listen_port
-        self.process_name = process_name
+        self.window_title = window_title
+        self.standalone = standalone
         self.running = False
         self.detections: List[Dict] = []
-        self.last_infer_ms = 0.0
         self._socket = None
-        self._hwnd = None
-        self._target_rect = None
+        self._impl = None
+        self._width = 0
+        self._height = 0
         self._last_update = 0.0
+        self._start_time = time.time()
+        self._frame_count = 0
+        self._fps = 0.0
 
     async def start(self):
         self.running = True
         self._socket = await self._setup_udp()
-        if self.process_name:
+
+        if not self.standalone and self.window_title:
             self._find_and_create_overlay()
+        else:
+            self._create_standalone_overlay()
+
         logger.info(
             f"Client visualizer listening on port {self.listen_port}"
-            + (
-                f"  target={self.process_name}"
-                if self.process_name
-                else "  (standalone mode)"
-            )
+            + (f"  target={self.window_title}" if self.window_title and not self.standalone else "  (standalone mode)")
         )
 
     def _find_and_create_overlay(self):
-        matches = _find_window_by_process(self.process_name)
-        if not matches:
-            logger.warning(
-                f"No window found for '{self.process_name}'. "
-                f"Overlay will be created when window appears."
-            )
+        img, monitor_info = capture_window_linux(self.window_title)
+        if img is None or monitor_info is None:
+            logger.warning(f"No window found for '{self.window_title}'. Overlay will be created when window appears.")
             return
-        hwnd, rect = matches[0]
-        self._target_rect = rect
-        self._create_overlay_for_rect(rect)
-        logger.info(f"Overlay created on window: {hwnd}  rect={rect}")
+        left, top = monitor_info['left'], monitor_info['top']
+        width, height = monitor_info['width'], monitor_info['height']
+        self._create_overlay_at(left, top, width, height)
 
-    def _create_overlay_for_rect(self, rect):
-        left, top, right, bottom = rect
-        width = right - left
-        height = bottom - top
-        if width <= 0 or height <= 0:
-            return
+    def _create_standalone_overlay(self):
+        self._create_overlay_at(100, 100, 1280, 720)
 
-        import win32gui
-
-        if self._hwnd is not None:
-            try:
-                win32gui.DestroyWindow(self._hwnd)
-            except Exception:
-                pass
-            self._hwnd = None
-
-        self._hwnd = _create_overlay_window(left, top, right, bottom)
-        _overlay_state["hwnd"] = self._hwnd
-        _overlay_state["width"] = width
-        _overlay_state["height"] = height
-        _overlay_state["_start_time"] = time.time()
-        if self._hwnd:
-            logger.info(
-                f"Overlay window {self._hwnd} at ({left},{top}) {width}x{height}"
-            )
+    def _create_overlay_at(self, x, y, width, height):
+        global _overlay_window
+        self._impl = _init_overlay_window(width, height)
+        glfw.set_window_pos(_overlay_window, x, y)
+        self._width = width
+        self._height = height
+        self._start_time = time.time()
+        logger.info(f"Overlay at ({x},{y}) {width}x{height}")
 
     async def _setup_udp(self):
         loop = asyncio.get_running_loop()
@@ -388,22 +254,10 @@ class ClientVisualizer:
                 try:
                     msg = json.loads(data.decode("utf-8"))
                     self.detections = msg.get("detections", [])
-                    self.last_infer_ms = msg.get("ts_infer_ms", 0)
-                    _overlay_state["detections"] = self.detections
-                    _overlay_state["last_infer_ms"] = self.last_infer_ms
-                    if self._hwnd is not None:
+                    if self._impl is not None:
                         try:
-                            import win32con
-                            import win32gui
-
-                            win32gui.RedrawWindow(
-                                self._hwnd,
-                                None,
-                                None,
-                                win32con.RDW_INVALIDATE
-                                | win32con.RDW_UPDATENOW
-                                | win32con.RDW_NOCHILDREN,
-                            )
+                            import imgui
+                            imgui.reload()
                         except Exception:
                             pass
                 except Exception as e:
@@ -414,27 +268,66 @@ class ClientVisualizer:
         )
         return protocol
 
-    def _update_overlay_position(self):
-        if not self.process_name or self._hwnd is None:
-            return
-        matches = _find_window_by_process(self.process_name)
-        if not matches:
-            return
-        _, rect = matches[0]
-        if rect == self._target_rect:
-            return
-        self._target_rect = rect
-        self._create_overlay_for_rect(rect)
-
     async def run(self):
         await self.start()
         logger.info("Press 'q' to quit")
+
+        if not self.standalone and self.window_title:
+            detection_gen = _run_detection_loop(self.window_title)
+        else:
+            detection_gen = None
+
         try:
-            while self.running:
-                now = time.time()
-                if now - self._last_update > 1.0:
-                    self._last_update = now
-                    self._update_overlay_position()
+            while not glfw.window_should_close(_overlay_window if self._impl else None):
+                glfw.poll_events()
+                if self._impl:
+                    self._impl.process_inputs()
+                    imgui.new_frame()
+
+                    imgui.set_next_window_size(self._width, self._height)
+                    imgui.set_next_window_position(0, 0)
+                    imgui.begin("overlay",
+                                flags=imgui.WINDOW_NO_TITLE_BAR
+                                      | imgui.WINDOW_NO_RESIZE
+                                      | imgui.WINDOW_NO_SCROLLBAR
+                                      | imgui.WINDOW_NO_COLLAPSE
+                                      | imgui.WINDOW_NO_BACKGROUND)
+
+                    draw_list = imgui.get_window_draw_list()
+
+                    if detection_gen:
+                        next(detection_gen)
+                    else:
+                        global detections
+                        detections = self.detections
+
+                    _esp(draw_list)
+
+                    # HUD
+                    self._frame_count += 1
+                    elapsed = time.time() - self._start_time
+                    if elapsed > 0:
+                        self._fps = self._frame_count / elapsed
+
+                    hud_lines = [
+                        f"FPS: {self._fps:.1f}",
+                        f"Detections: {len(detections)}",
+                    ]
+                    y_off = 20
+                    for line in hud_lines:
+                        # ImGui text drawing
+                        draw_list.add_text(0, y_off, imgui.get_color_u32_rgba(1, 1, 1, 1), line)
+                        y_off += 22
+
+                    imgui.end()
+                    imgui.end_frame()
+
+                    gl.glClearColor(0, 0, 0, 0)
+                    gl.glClear(gl.GL_COLOR_BUFFER_BIT)
+                    imgui.render()
+                    self._impl.render(imgui.get_draw_data())
+                    glfw.swap_buffers(_overlay_window)
+
                 await asyncio.sleep(0.01)
         except KeyboardInterrupt:
             self.running = False
@@ -443,33 +336,26 @@ class ClientVisualizer:
 
     def stop(self):
         self.running = False
-        if self._hwnd is not None:
-            try:
-                import win32gui
-
-                win32gui.DestroyWindow(self._hwnd)
-            except Exception:
-                pass
-            self._hwnd = None
+        if self._impl:
+            self._impl.shutdown()
+            glfw.terminate()
         logger.info("Visualizer stopped")
 
 
 async def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description="ESP Lab Client Visualizer")
-    parser.add_argument(
-        "--port", type=int, default=8888, help="UDP listen port (default: 8888)"
-    )
-    parser.add_argument(
-        "--process",
-        type=str,
-        default="",
-        help="Process name to overlay on (e.g. 'Game.exe'). Leave empty for standalone window mode.",
-    )
+    parser = argparse.ArgumentParser(description="ESP Lab Client Visualizer (Linux)")
+    parser.add_argument("--port", type=int, default=8888, help="UDP listen port (default: 8888)")
+    parser.add_argument("--window", type=str, default="", help="Window title to overlay on")
+    parser.add_argument("--standalone", action="store_true", help="Run as standalone overlay window")
     args = parser.parse_args()
 
-    visualizer = ClientVisualizer(listen_port=args.port, process_name=args.process)
+    visualizer = ClientVisualizer(
+        listen_port=args.port,
+        window_title=args.window,
+        standalone=args.standalone or not args.window,
+    )
     await visualizer.run()
 
 
