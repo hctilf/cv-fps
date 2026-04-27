@@ -1,0 +1,62 @@
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ML models (large binary files)
+models/*.pt
+models/*.onnx
+models/*.engine
+*.pt
+*.onnx
+*.engine
+
+# Environment
+.env
+.env.local
+.env.production
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Generated fixtures
+tests/fixtures/*.jpg
+tests/fixtures/*.jpeg
+tests/fixtures/*.png
+
+# Jupyter
+.ipynb_checkpoints
+
+# Docker
+.dockerenv
