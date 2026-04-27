@@ -10,3 +10,9 @@ prometheus-client>=0.17.0
 jsonschema>=4.19.0
 numpy>=1.24.0
 pywin32>=306; sys_platform == 'win32'
+glfw>=2.0.0
+imgui[binary]>=2.0.0
+PyOpenGL>=3.1.0
+mss>=9.0.0
+python-xlib>=0.33; sys_platform == 'linux'
+ewmh>=0.1.6; sys_platform == 'linux'
