@@ -69,7 +69,6 @@ class InferenceWorker:
 
         ctx = zmq_ctx or self._zmq_ctx
         self._socket_pull = ctx.socket(zmq.PULL)
-        self._socket_pull.setsockopt_string(zmq.SUBSCRIBE, "")
         self._socket_pull.bind(self._pull_url)
 
         self._socket_push = ctx.socket(zmq.PUSH)

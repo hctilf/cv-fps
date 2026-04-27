@@ -51,10 +51,7 @@ python client_visualizer.py
 
 ```bash
 # On the game PC, send screen capture to the inference server
-ffmpeg -f gdigrab -i desktop \
-  -vf scale=640:640,fps=120 \
-  -vcodec mjpeg -q:v 5 \
-  -f mpegudp udp://192.168.1.17:9999
+ffmpeg -f gdigrab -i desktop -vf scale=640:640,fps=120 -vcodec mjpeg -q:v 5 -thread_type slice -threads 0 -f mjpeg udp://192.168.1.17:9999
 ```
 
 ## Configuration
