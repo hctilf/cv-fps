@@ -1,11 +1,13 @@
-"""Client visualizer: receives bbox JSON from server, draws overlay on a target window (Linux)."""
+"""Client visualizer: receives bbox JSON from server, draws overlay on a target window."""
 
 import asyncio
 import json
 import logging
 import math
+import platform
+import sys
 import time
-from typing import List, Dict
+from typing import List, Dict, Optional, Tuple
 
 import cv2
 import glfw
@@ -17,9 +19,16 @@ from OpenGL import GL as gl
 
 logger = logging.getLogger(__name__)
 
+OS_NAME = platform.system()  # 'Windows', 'Linux', 'Darwin'
 
-def capture_window_linux(window_title: str):
-    """Linux implementation using ewmh and Xlib."""
+
+# ---------------------------------------------------------------------------
+# Window capture — Linux
+# ---------------------------------------------------------------------------
+
+
+def _capture_window_linux(window_title: str) -> Optional[Tuple[np.ndarray, dict]]:
+    """Linux: ewmh + Xlib + mss."""
     try:
         from ewmh import EWMH
         from Xlib.display import Display
@@ -27,12 +36,16 @@ def capture_window_linux(window_title: str):
         ewmh = EWMH()
         display = Display()
 
-        windows = [win for win in ewmh.getClientList()
-                   if window_title in (ewmh.getWmName(win) or b'').decode('utf-8', errors='ignore')]
+        windows = [
+            win
+            for win in ewmh.getClientList()
+            if window_title
+            in (ewmh.getWmName(win) or b"").decode("utf-8", errors="ignore")
+        ]
 
         if not windows:
             logger.debug(f"Window '{window_title}' not found")
-            return None, None
+            return None
 
         window = windows[0]
         geom = window.get_geometry()
@@ -40,17 +53,17 @@ def capture_window_linux(window_title: str):
 
         if attrs.map_state != 2:
             logger.debug(f"Window '{window_title}' is not visible")
-            return None, None
+            return None
 
         win_x, win_y = geom.x, geom.y
         win_width, win_height = geom.width, geom.height
 
         try:
             frame_extents = ewmh.getFrameExtents(window)
-            left = win_x - frame_extents['left']
-            top = win_y - frame_extents['top']
-            width = win_width + frame_extents['left'] + frame_extents['right']
-            height = win_height + frame_extents['top'] + frame_extents['bottom']
+            left = win_x - frame_extents["left"]
+            top = win_y - frame_extents["top"]
+            width = win_width + frame_extents["left"] + frame_extents["right"]
+            height = win_height + frame_extents["top"] + frame_extents["bottom"]
         except Exception:
             left, top = win_x, win_y
             width, height = win_width, win_height
@@ -68,11 +81,104 @@ def capture_window_linux(window_title: str):
             img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
             return img, monitor
     except Exception as e:
-        logger.debug(f"Capture error: {e}")
-        return None, None
+        logger.debug(f"Linux capture error: {e}")
+        return None
 
 
-# --- OVERLAY DRAWING LOGIC ---
+# ---------------------------------------------------------------------------
+# Window capture — Windows
+# ---------------------------------------------------------------------------
+
+
+def _capture_window_windows(window_title: str) -> Optional[Tuple[np.ndarray, dict]]:
+    """Windows: pygetwindow + mss."""
+    try:
+        import pygetwindow as gw
+
+        windows = gw.getWindowsWithTitle(window_title)
+        if not windows:
+            logger.debug(f"Window '{window_title}' not found")
+            return None
+
+        w = windows[0]
+        left, top, width, height = w.left, w.top, w.width, w.height
+
+        if width <= 0 or height <= 0:
+            return None
+
+        monitor = {
+            "top": top,
+            "left": left,
+            "width": width,
+            "height": height,
+        }
+
+        with mss.mss() as sct:
+            screenshot = sct.grab(monitor)
+            img = np.array(screenshot)
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+            return img, monitor
+    except Exception as e:
+        logger.debug(f"Windows capture error: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Window capture — dispatcher
+# ---------------------------------------------------------------------------
+
+
+def capture_window(window_title: str):
+    """Capture window by title — delegates to platform-specific impl."""
+    if OS_NAME == "Windows":
+        return _capture_window_windows(window_title)
+    elif OS_NAME == "Linux":
+        return _capture_window_linux(window_title)
+    else:
+        logger.warning(f"Unsupported OS: {OS_NAME}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Window finding by process name (Windows only)
+# ---------------------------------------------------------------------------
+
+
+def _find_window_by_process(process_name: str):
+    """Find the first top-level window whose process name matches."""
+    import win32gui
+    import win32process
+
+    results = []
+
+    def enum_cb(hwnd, acc):
+        try:
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            handle = __import__("ctypes").windll.kernel32.OpenProcess(
+                0x0410, False, pid
+            )
+            if handle:
+                try:
+                    buf = __import__("ctypes").create_unicode_buffer(260)
+                    __import__("ctypes").windll.psapi.GetProcessImageFileNameW(
+                        handle, buf, 260
+                    )
+                    __import__("ctypes").windll.kernel32.CloseHandle(handle)
+                    if process_name.lower() in buf.value.lower():
+                        acc.append((hwnd, win32gui.GetWindowRect(hwnd)))
+                except Exception:
+                    __import__("ctypes").windll.kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+        return True
+
+    win32gui.EnumWindows(enum_cb, results)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Overlay drawing logic
+# ---------------------------------------------------------------------------
 
 detections: List[Dict] = []
 _overlay_window = None
@@ -90,11 +196,17 @@ def _esp(draw_list):
 
         color = _get_class_color(cls_name)
         r, g, b = color
-        draw_list.add_rect(x1, y1, x2, y2,
-                           imgui.get_color_u32_rgba(r / 255.0, g / 255.0, b / 255.0, 1.0),
-                           thickness=2)
-        draw_list.add_text(x1, y1 - 15,
-                           imgui.get_color_u32_rgba(1, 1, 1, 1), label)
+        draw_list.add_rect(
+            x1,
+            y1,
+            x2,
+            y2,
+            imgui.get_color_u32_rgba(r / 255.0, g / 255.0, b / 255.0, 1.0),
+            thickness=2,
+        )
+        draw_list.add_text(
+            x1, y1 - 15, imgui.get_color_u32_rgba(1, 1, 1, 1), label
+        )
 
 
 def _get_class_color(cls_name: str):
@@ -110,7 +222,10 @@ def _get_class_color(cls_name: str):
     return colors.get(cls_name, (200, 200, 200))
 
 
-# --- GLFW / IMGUI INITIALIZATION ---
+# ---------------------------------------------------------------------------
+# GLFW / ImGui initialization
+# ---------------------------------------------------------------------------
+
 
 def _init_overlay_window(width: int, height: int):
     global _overlay_window
@@ -137,38 +252,114 @@ def _init_overlay_window(width: int, height: int):
     return impl
 
 
-# --- MAIN LOOP ---
+# ---------------------------------------------------------------------------
+# Detection loop
+# ---------------------------------------------------------------------------
 
 def _run_detection_loop(window_title: str):
     """Generator that captures, runs inference, yields detections."""
     global _model
     if _model is None:
         from ultralytics import YOLO
+
         _model = YOLO("yolo11n.pt").to("cpu")
 
-    class_names = ["person", "bicycle", "car", "motorbike", "aeroplane", "bus", "train", "truck", "boat",
-                   "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat",
-                   "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella",
-                   "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball", "kite", "baseball bat",
-                   "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle", "wine glass", "cup",
-                   "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange", "broccoli",
-                   "carrot", "hot dog", "pizza", "donut", "cake", "chair", "sofa", "pottedplant", "bed",
-                   "diningtable", "toilet", "tvmonitor", "laptop", "mouse", "remote", "keyboard", "cell phone",
-                   "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors",
-                   "teddy bear", "hair drier", "toothbrush"]
+    class_names = [
+        "person",
+        "bicycle",
+        "car",
+        "motorbike",
+        "aeroplane",
+        "bus",
+        "train",
+        "truck",
+        "boat",
+        "traffic light",
+        "fire hydrant",
+        "stop sign",
+        "parking meter",
+        "bench",
+        "bird",
+        "cat",
+        "dog",
+        "horse",
+        "sheep",
+        "cow",
+        "elephant",
+        "bear",
+        "zebra",
+        "giraffe",
+        "backpack",
+        "umbrella",
+        "handbag",
+        "tie",
+        "suitcase",
+        "frisbee",
+        "skis",
+        "snowboard",
+        "sports ball",
+        "kite",
+        "baseball bat",
+        "baseball glove",
+        "skateboard",
+        "surfboard",
+        "tennis racket",
+        "bottle",
+        "wine glass",
+        "cup",
+        "fork",
+        "knife",
+        "spoon",
+        "bowl",
+        "banana",
+        "apple",
+        "sandwich",
+        "orange",
+        "broccoli",
+        "carrot",
+        "hot dog",
+        "pizza",
+        "donut",
+        "cake",
+        "chair",
+        "sofa",
+        "pottedplant",
+        "bed",
+        "diningtable",
+        "toilet",
+        "tvmonitor",
+        "laptop",
+        "mouse",
+        "remote",
+        "keyboard",
+        "cell phone",
+        "microwave",
+        "oven",
+        "toaster",
+        "sink",
+        "refrigerator",
+        "book",
+        "clock",
+        "vase",
+        "scissors",
+        "teddy bear",
+        "hair drier",
+        "toothbrush",
+    ]
 
     while True:
         global detections
         detections.clear()
 
-        img, monitor_info = capture_window_linux(window_title)
-        if img is None or monitor_info is None:
+        result = capture_window(window_title)
+        if result is None:
             time.sleep(0.1)
             yield
             continue
 
-        left, top = monitor_info['left'], monitor_info['top']
-        width, height = monitor_info['width'], monitor_info['height']
+        img, monitor_info = result
+        left, top = monitor_info["left"], monitor_info["top"]
+        width, height = monitor_info["width"], monitor_info["height"]
 
         glfw.set_window_pos(_overlay_window, left, top)
 
@@ -181,21 +372,33 @@ def _run_detection_loop(window_title: str):
                 conf = math.ceil((box.conf[0] * 100)) / 100
                 cls = int(box.cls[0])
                 class_name = class_names[cls]
-                detections.append({
-                    "class": class_name,
-                    "bbox": [x1, y1, x2, y2],
-                    "conf": conf,
-                })
+                detections.append(
+                    {
+                        "class": class_name,
+                        "bbox": [x1, y1, x2, y2],
+                        "conf": conf,
+                    }
+                )
 
         yield
 
 
-# --- MAIN VISUALIZER ---
+# ---------------------------------------------------------------------------
+# Main visualizer
+# ---------------------------------------------------------------------------
+
 
 class ClientVisualizer:
-    def __init__(self, listen_port: int = 8888, window_title: str = "", standalone: bool = True):
+    def __init__(
+        self,
+        listen_port: int = 8888,
+        window_title: str = "",
+        process_name: str = "",
+        standalone: bool = True,
+    ):
         self.listen_port = listen_port
         self.window_title = window_title
+        self.process_name = process_name
         self.standalone = standalone
         self.running = False
         self.detections: List[Dict] = []
@@ -214,27 +417,55 @@ class ClientVisualizer:
 
         if not self.standalone and self.window_title:
             self._find_and_create_overlay()
+        elif not self.standalone and self.process_name:
+            self._find_by_process_and_create_overlay()
         else:
             self._create_standalone_overlay()
 
         logger.info(
             f"Client visualizer listening on port {self.listen_port}"
-            + (f"  target={self.window_title}" if self.window_title and not self.standalone else "  (standalone mode)")
+            + (
+                f"  target={self.window_title or self.process_name}"
+                if self.window_title or self.process_name
+                else "  (standalone mode)"
+            )
         )
 
     def _find_and_create_overlay(self):
-        img, monitor_info = capture_window_linux(self.window_title)
-        if img is None or monitor_info is None:
-            logger.warning(f"No window found for '{self.window_title}'. Overlay will be created when window appears.")
+        result = capture_window(self.window_title)
+        if result is None:
+            logger.warning(
+                f"No window found for '{self.window_title}'. "
+                f"Overlay will be created when window appears."
+            )
             return
-        left, top = monitor_info['left'], monitor_info['top']
-        width, height = monitor_info['width'], monitor_info['height']
+        img, monitor_info = result
+        left, top = monitor_info["left"], monitor_info["top"]
+        width, height = monitor_info["width"], monitor_info["height"]
         self._create_overlay_at(left, top, width, height)
+
+    def _find_by_process_and_create_overlay(self):
+        if OS_NAME != "Windows":
+            logger.warning("--process only works on Windows")
+            return
+        matches = _find_window_by_process(self.process_name)
+        if not matches:
+            logger.warning(
+                f"No window found for process '{self.process_name}'. "
+                f"Overlay will be created when window appears."
+            )
+            return
+        hwnd, rect = matches[0]
+        left, top, right, bottom = rect
+        width = right - left
+        height = bottom - top
+        self._create_overlay_at(left, top, width, height)
+        logger.info(f"Overlay created on window {hwnd}  rect={rect}")
 
     def _create_standalone_overlay(self):
         self._create_overlay_at(100, 100, 1280, 720)
 
-    def _create_overlay_at(self, x, y, width, height):
+    def _create_overlay_at(self, x: int, y: int, width: int, height: int):
         global _overlay_window
         self._impl = _init_overlay_window(width, height)
         glfw.set_window_pos(_overlay_window, x, y)
@@ -254,12 +485,6 @@ class ClientVisualizer:
                 try:
                     msg = json.loads(data.decode("utf-8"))
                     self.detections = msg.get("detections", [])
-                    if self._impl is not None:
-                        try:
-                            import imgui
-                            imgui.reload()
-                        except Exception:
-                            pass
                 except Exception as e:
                     logger.debug(f"JSON parse error: {e}")
 
@@ -272,61 +497,66 @@ class ClientVisualizer:
         await self.start()
         logger.info("Press 'q' to quit")
 
-        if not self.standalone and self.window_title:
-            detection_gen = _run_detection_loop(self.window_title)
+        if not self.standalone and (self.window_title or self.process_name):
+            target = self.window_title or self.process_name
+            detection_gen = _run_detection_loop(target)
         else:
             detection_gen = None
 
         try:
-            while not glfw.window_should_close(_overlay_window if self._impl else None):
+            while self._impl and not glfw.window_should_close(_overlay_window):
                 glfw.poll_events()
-                if self._impl:
-                    self._impl.process_inputs()
-                    imgui.new_frame()
+                self._impl.process_inputs()
+                imgui.new_frame()
 
-                    imgui.set_next_window_size(self._width, self._height)
-                    imgui.set_next_window_position(0, 0)
-                    imgui.begin("overlay",
-                                flags=imgui.WINDOW_NO_TITLE_BAR
-                                      | imgui.WINDOW_NO_RESIZE
-                                      | imgui.WINDOW_NO_SCROLLBAR
-                                      | imgui.WINDOW_NO_COLLAPSE
-                                      | imgui.WINDOW_NO_BACKGROUND)
+                imgui.set_next_window_size(self._width, self._height)
+                imgui.set_next_window_position(0, 0)
+                imgui.begin(
+                    "overlay",
+                    flags=(
+                        imgui.WINDOW_NO_TITLE_BAR
+                        | imgui.WINDOW_NO_RESIZE
+                        | imgui.WINDOW_NO_SCROLLBAR
+                        | imgui.WINDOW_NO_COLLAPSE
+                        | imgui.WINDOW_NO_BACKGROUND
+                    ),
+                )
 
-                    draw_list = imgui.get_window_draw_list()
+                draw_list = imgui.get_window_draw_list()
 
-                    if detection_gen:
-                        next(detection_gen)
-                    else:
-                        global detections
-                        detections = self.detections
+                if detection_gen:
+                    next(detection_gen)
+                else:
+                    global detections
+                    detections = self.detections
 
-                    _esp(draw_list)
+                _esp(draw_list)
 
-                    # HUD
-                    self._frame_count += 1
-                    elapsed = time.time() - self._start_time
-                    if elapsed > 0:
-                        self._fps = self._frame_count / elapsed
+                # HUD
+                self._frame_count += 1
+                elapsed = time.time() - self._start_time
+                if elapsed > 0:
+                    self._fps = self._frame_count / elapsed
 
-                    hud_lines = [
-                        f"FPS: {self._fps:.1f}",
-                        f"Detections: {len(detections)}",
-                    ]
-                    y_off = 20
-                    for line in hud_lines:
-                        # ImGui text drawing
-                        draw_list.add_text(0, y_off, imgui.get_color_u32_rgba(1, 1, 1, 1), line)
-                        y_off += 22
+                hud_lines = [
+                    f"FPS: {self._fps:.1f}",
+                    f"Detections: {len(detections)}",
+                ]
+                y_off = 20
+                for line in hud_lines:
+                    draw_list.add_text(
+                        0, y_off, imgui.get_color_u32_rgba(1, 1, 1, 1), line
+                    )
+                    y_off += 22
 
-                    imgui.end()
-                    imgui.end_frame()
+                imgui.end()
+                imgui.end_frame()
 
-                    gl.glClearColor(0, 0, 0, 0)
-                    gl.glClear(gl.GL_COLOR_BUFFER_BIT)
-                    imgui.render()
-                    self._impl.render(imgui.get_draw_data())
-                    glfw.swap_buffers(_overlay_window)
+                gl.glClearColor(0, 0, 0, 0)
+                gl.glClear(gl.GL_COLOR_BUFFER_BIT)
+                imgui.render()
+                self._impl.render(imgui.get_draw_data())
+                glfw.swap_buffers(_overlay_window)
 
                 await asyncio.sleep(0.01)
         except KeyboardInterrupt:
@@ -345,16 +575,36 @@ class ClientVisualizer:
 async def main():
     import argparse
 
-    parser = argparse.ArgumentParser(description="ESP Lab Client Visualizer (Linux)")
-    parser.add_argument("--port", type=int, default=8888, help="UDP listen port (default: 8888)")
-    parser.add_argument("--window", type=str, default="", help="Window title to overlay on")
-    parser.add_argument("--standalone", action="store_true", help="Run as standalone overlay window")
+    parser = argparse.ArgumentParser(description="ESP Lab Client Visualizer")
+    parser.add_argument(
+        "--port", type=int, default=8888, help="UDP listen port (default: 8888)"
+    )
+    parser.add_argument(
+        "--window", type=str, default="", help="Window title to overlay on"
+    )
+    parser.add_argument(
+        "--process",
+        type=str,
+        default="",
+        help="Process name to overlay on (Windows only, e.g. 'Ravenfield.exe')",
+    )
+    parser.add_argument(
+        "--standalone",
+        action="store_true",
+        help="Run as standalone overlay window",
+    )
     args = parser.parse_args()
+
+    if args.standalone or (not args.window and not args.process):
+        standalone = True
+    else:
+        standalone = False
 
     visualizer = ClientVisualizer(
         listen_port=args.port,
         window_title=args.window,
-        standalone=args.standalone or not args.window,
+        process_name=args.process,
+        standalone=standalone,
     )
     await visualizer.run()
 
